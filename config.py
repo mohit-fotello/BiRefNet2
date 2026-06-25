@@ -17,7 +17,7 @@ class Config():
         self.data_root_dir = os.path.join(self.sys_home_dir, 'datasets/dis')
 
         # TASK settings
-        self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting'][0]
+        self.task = ['DIS5K', 'COD', 'HRSOD', 'General', 'General-2K', 'Matting', 'WallMasking'][-1]
         self.testsets = {
             # Benchmarks
             'DIS5K': ','.join(['DIS-VD', 'DIS-TE1', 'DIS-TE2', 'DIS-TE3', 'DIS-TE4'][:1]),
@@ -145,6 +145,12 @@ class Config():
                 'ssim': 10 * 1,
                 'cnt': 5 * 0,
                 'structure': 5 * 0,
+            }
+        
+        elif self.task in ['WallMasking']:
+            self.lambdas_pix_last = {
+                'iou': 0.5 * 1,
+                'iou_patch': 0.5 * 1,
             }
         else:
             self.lambdas_pix_last = {

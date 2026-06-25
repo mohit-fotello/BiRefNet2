@@ -80,6 +80,11 @@ class PatchIoULoss(torch.nn.Module):
         self.iou_loss = IoULoss()
 
     def forward(self, pred, target):
+        print('pred shape is :' , pred.shape)
+        print('target shape is :' , target.shape)
+        if len(target.shape) > 3:
+            raise RuntimeError(f'LOUD EXCEPTION: target shape rank is > 3: {target.shape}')
+
         win_y, win_x = 64, 64
         iou_loss = 0.
         for anchor_y in range(0, target.shape[0], win_y):
