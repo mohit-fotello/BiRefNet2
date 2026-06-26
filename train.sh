@@ -10,10 +10,12 @@ case "${task}" in
     'General') epochs=200 && val_last=50 && step=5 ;;
     'General-2K') epochs=250 && val_last=30 && step=2 ;;
     'Matting') epochs=150 && val_last=50 && step=5 ;;
+    'WallMasking') epochs=120 && val_last=20 && step=5 ;;
 esac
 
 # Train
 devices=$2
+extra_args=("${@:3}")
 nproc_per_node=$(echo ${devices%%,} | grep -o "," | wc -l)
 
 to_be_distributed=`echo ${nproc_per_node} | awk '{if($e > 0) print "True"; else print "False";}'`
@@ -29,14 +31,16 @@ then
     train.py --ckpt_dir ckpts/${method} --epochs ${epochs} \
         --dist ${to_be_distributed} \
         --resume ${resume_weights_path} \
-        --use_accelerate
+        --use_accelerate \
+        "${extra_args[@]}"
 else
     echo "Single-GPU mode received..."
     CUDA_VISIBLE_DEVICES=${devices} \
     python train.py --ckpt_dir ckpts/${method} --epochs ${epochs} \
         --dist ${to_be_distributed} \
         --resume ${resume_weights_path} \
-        --use_accelerate
+        --use_accelerate \
+        "${extra_args[@]}"
 fi
 
 echo Training finished at $(date)

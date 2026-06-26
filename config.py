@@ -27,6 +27,7 @@ class Config():
             'General': ','.join(['DIS-VD', 'TE-P3M-500-NP']),
             'General-2K': ','.join(['DIS-VD', 'TE-P3M-500-NP']),
             'Matting': ','.join(['TE-P3M-500-NP', 'TE-AM-2k']),
+            'WallMasking': '',
         }[self.task]
         datasets_all = '+'.join([ds for ds in (os.listdir(os.path.join(self.data_root_dir, self.task)) if os.path.isdir(os.path.join(self.data_root_dir, self.task)) else []) if ds not in self.testsets.split(',')])
         self.training_set = {
@@ -36,6 +37,7 @@ class Config():
             'General': datasets_all,
             'General-2K': datasets_all,
             'Matting': datasets_all,
+            'WallMasking': datasets_all,
         }[self.task]
 
         # Data settings
@@ -71,6 +73,7 @@ class Config():
                 'General': -20,
                 'General-2K': -20,
                 'Matting': -10,
+                'WallMasking': -20,
             }[self.task]
         ][1]    # choose 0 to skip
         self.lr = (1e-4 if 'DIS5K' in self.task else 1e-5) * math.sqrt(self.batch_size / 4)     # DIS needs high lr to converge faster. Adapt the lr linearly

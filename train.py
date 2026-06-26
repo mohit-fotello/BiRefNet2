@@ -2,6 +2,7 @@ import os
 import datetime
 from contextlib import nullcontext
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,15 +20,45 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in ('true', '1', 'yes', 'y'):
+        return True
+    if value.lower() in ('false', '0', 'no', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+WANDB_PROJECT = 'birefnet-wallmasking'
+WANDB_ENTITY = None
+WANDB_RUN_NAME = None
+WANDB_MODE = 'online'
+WANDB_LOG_FREQ = 1
+WANDB_LOG_SAMPLES = True
+WANDB_SAMPLE_FREQ = 10
+WANDB_NUM_SAMPLES = 2
+WANDB_LOG_MODEL = False
+
+
 parser = argparse.ArgumentParser(description='')
 parser.add_argument('--resume', default=None, type=str, help='path to latest checkpoint')
 parser.add_argument('--epochs', default=120, type=int)
 parser.add_argument('--ckpt_dir', default='ckpts/tmp', help='Temporary folder')
+parser.add_argument('--batch_size', default=None, type=int, help='Override Config.batch_size.')
 parser.add_argument('--dist', default=False, type=lambda x: x == 'True')
 parser.add_argument('--use_accelerate', action='store_true', help='`accelerate launch --multi_gpu train.py --use_accelerate`. Use accelerate for training, good for FP16/BF16/...')
+parser.add_argument('--wandb', default=True, type=str2bool, nargs='?', const=True, help='Enable Weights & Biases logging.')
 args = parser.parse_args()
 
 config = Config()
+if args.batch_size is not None:
+    config.batch_size = args.batch_size
+    config.num_workers = max(4, config.batch_size)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device_seed = 0
+wandb = None
+wandb_run = None
 
 if args.use_accelerate:
     from accelerate import Accelerator, utils
@@ -53,14 +84,14 @@ to_be_distributed = args.dist
 if to_be_distributed:
     init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=3600*10))
     device = int(os.environ["LOCAL_RANK"])
+    device_seed = device
 else:
     if args.use_accelerate:
         device = accelerator.local_process_index
-    else:
-        device = config.device
+        device_seed = device
 
 if config.rand_seed:
-    set_seed(config.rand_seed + device)
+    set_seed(config.rand_seed + device_seed)
 
 epoch_st = 1
 # make dir for ckpt
@@ -79,6 +110,95 @@ logger.info("Other hyperparameters:"); logger.info(args)
 print('batch size:', config.batch_size)
 
 from dataset import custom_collate_fn
+
+
+def is_main_process():
+    if args.use_accelerate:
+        return accelerator.is_main_process
+    if to_be_distributed:
+        return int(os.environ.get('RANK', '0')) == 0
+    return True
+
+
+def is_wandb_enabled():
+    return wandb_run is not None and is_main_process()
+
+
+def config_to_dict():
+    simple_types = (str, int, float, bool, type(None), tuple, list, dict)
+    return {k: v for k, v in config.__dict__.items() if isinstance(v, simple_types)}
+
+
+def init_wandb():
+    global wandb, wandb_run
+    if not args.wandb or not is_main_process():
+        return
+    try:
+        import wandb as wandb_module
+    except ImportError as exc:
+        raise SystemExit('Install wandb or run without --wandb. Try: pip install wandb') from exc
+
+    wandb = wandb_module
+    wandb_run = wandb.init(
+        project=WANDB_PROJECT,
+        entity=WANDB_ENTITY,
+        name=WANDB_RUN_NAME,
+        mode=WANDB_MODE,
+        dir=args.ckpt_dir,
+        config={
+            'args': vars(args),
+            'config': config_to_dict(),
+        },
+    )
+    wandb.define_metric('train/step')
+    wandb.define_metric('train/*', step_metric='train/step')
+    wandb.define_metric('epoch')
+    wandb.define_metric('epoch/*', step_metric='epoch')
+
+
+def tensor_to_wandb_image(tensor, image_type='mask'):
+    tensor = tensor.detach().float().cpu()
+    if tensor.ndim == 3 and tensor.shape[0] == 3:
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        array = (tensor * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
+    else:
+        array = tensor.squeeze().clamp(0, 1).numpy()
+    array = (array * 255).astype(np.uint8)
+    return wandb.Image(array, mode='RGB' if image_type == 'rgb' else 'L')
+
+
+def log_wandb_samples(inputs, gts, scaled_preds, epoch, batch_idx, global_step):
+    if not is_wandb_enabled() or not WANDB_LOG_SAMPLES:
+        return
+    pred = scaled_preds[-1]
+    if pred.shape[2:] != gts.shape[2:]:
+        pred = nn.functional.interpolate(pred, size=gts.shape[2:], mode='bilinear', align_corners=True)
+    pred = pred.sigmoid()
+    sample_count = min(WANDB_NUM_SAMPLES, inputs.shape[0])
+    table = wandb.Table(columns=['epoch', 'batch', 'sample', 'image', 'ground_truth', 'prediction'])
+    for sample_idx in range(sample_count):
+        table.add_data(
+            epoch,
+            batch_idx,
+            sample_idx,
+            tensor_to_wandb_image(inputs[sample_idx], 'rgb'),
+            tensor_to_wandb_image(gts[sample_idx], 'mask'),
+            tensor_to_wandb_image(pred[sample_idx], 'mask'),
+        )
+    wandb.log({'train/samples': table, 'train/step': global_step, 'epoch': epoch}, step=global_step)
+
+
+def log_wandb_checkpoint(checkpoint_path, epoch):
+    if not is_wandb_enabled() or not WANDB_LOG_MODEL:
+        return
+    artifact = wandb.Artifact(f'{wandb_run.name}-checkpoint', type='model')
+    artifact.add_file(checkpoint_path)
+    artifact.metadata = {'epoch': epoch, 'checkpoint_path': checkpoint_path}
+    wandb_run.log_artifact(artifact, aliases=[f'epoch-{epoch}', 'latest'])
+
+
+init_wandb()
 
 def prepare_dataloader(dataset: torch.utils.data.Dataset, batch_size: int, to_be_distributed=False, is_train=True):
     # Prepare dataloaders
@@ -164,8 +284,9 @@ class Trainer:
         
         # Others
         self.loss_log = AverageMeter()
+        self.global_step = 0
 
-    def _train_batch(self, batch):
+    def _train_batch(self, batch, epoch, batch_idx, capture_samples=False):
         if args.use_accelerate:
             inputs = batch[0]#.to(device)
             gts = batch[1]#.to(device)
@@ -198,32 +319,51 @@ class Trainer:
         if config.out_ref:
             loss = loss + loss_gdt * 1.0
 
-        self.loss_log.update(loss.item(), inputs.size(0))
+        loss_value = loss.item()
+        self.loss_log.update(loss_value, inputs.size(0))
+        if capture_samples:
+            log_wandb_samples(inputs, gts, scaled_preds, epoch, batch_idx, self.global_step)
         if args.use_accelerate:
             loss = loss / accelerator.gradient_accumulation_steps
             accelerator.backward(loss)
         else:
             loss.backward()
         self.optimizer.step()
+        return loss_value
 
     def train_epoch(self, epoch):
         global logger_loss_idx
         self.model.train()
         self.loss_dict = {}
-        if epoch > args.epochs + config.finetune_last_epochs:
+        if config.task != 'WallMasking' and epoch > args.epochs + config.finetune_last_epochs:
             if config.task == 'Matting':
-                self.pix_loss.lambdas_pix_last['mae'] *= 1
-                self.pix_loss.lambdas_pix_last['mse'] *= 0.9
-                self.pix_loss.lambdas_pix_last['ssim'] *= 0.9
+                for loss_name, multiplier in {'mae': 1, 'mse': 0.9, 'ssim': 0.9}.items():
+                    if loss_name in self.pix_loss.lambdas_pix_last:
+                        self.pix_loss.lambdas_pix_last[loss_name] *= multiplier
             else:
-                self.pix_loss.lambdas_pix_last['bce'] *= 0
-                self.pix_loss.lambdas_pix_last['ssim'] *= 1
-                self.pix_loss.lambdas_pix_last['iou'] *= 0.5
-                self.pix_loss.lambdas_pix_last['mae'] *= 0.9
+                for loss_name, multiplier in {'bce': 0, 'ssim': 1, 'iou': 0.5, 'mae': 0.9}.items():
+                    if loss_name in self.pix_loss.lambdas_pix_last:
+                        self.pix_loss.lambdas_pix_last[loss_name] *= multiplier
 
         for batch_idx, batch in enumerate(self.train_loader):
             # with nullcontext if not args.use_accelerate or accelerator.gradient_accumulation_steps <= 1 else accelerator.accumulate(self.model):
-            self._train_batch(batch)
+            capture_samples = (
+                WANDB_LOG_SAMPLES
+                and batch_idx == 0
+                and epoch % max(WANDB_SAMPLE_FREQ, 1) == 0
+            )
+            loss_value = self._train_batch(batch, epoch, batch_idx, capture_samples=capture_samples)
+            if is_wandb_enabled() and self.global_step % max(WANDB_LOG_FREQ, 1) == 0:
+                wandb_logs = {
+                    'train/step': self.global_step,
+                    'train/loss': loss_value,
+                    'train/loss_avg': self.loss_log.avg,
+                    'train/lr': self.optimizer.param_groups[0]['lr'],
+                    'epoch': epoch,
+                    'batch': batch_idx,
+                }
+                wandb_logs.update({f'train/{name}': value for name, value in self.loss_dict.items()})
+                wandb.log(wandb_logs, step=self.global_step)
             # Logger
             if (epoch < 2 and batch_idx < 100 and batch_idx % 20 == 0) or batch_idx % max(100, len(self.train_loader) / 100 // 100 * 100) == 0:
                 info_progress = f'Epoch[{epoch}/{args.epochs}] Iter[{batch_idx}/{len(self.train_loader)}].'
@@ -231,8 +371,18 @@ class Trainer:
                 for loss_name, loss_value in self.loss_dict.items():
                     info_loss += f' {loss_name}: {loss_value:.5g} |'
                 logger.info(' '.join((info_progress, info_loss)))
+            self.global_step += 1
         info_loss = f'@==Final== Epoch[{epoch}/{args.epochs}]  Training Loss: {self.loss_log.avg:.5g}  '
         logger.info(info_loss)
+        if is_wandb_enabled():
+            wandb.log(
+                {
+                    'epoch': epoch,
+                    'epoch/train_loss': self.loss_log.avg,
+                    'epoch/lr': self.optimizer.param_groups[0]['lr'],
+                },
+                step=self.global_step,
+            )
 
         self.lr_scheduler.step()
         return self.loss_log.avg
@@ -247,15 +397,19 @@ def main():
 
     for epoch in range(epoch_st, args.epochs+1):
         train_loss = trainer.train_epoch(epoch)
-        # Save checkpoint
-        if epoch >= args.epochs - config.save_last and epoch % config.save_step == 0:
+        # Save only the latest checkpoint to avoid accumulating large epoch files.
+        if epoch % config.save_step == 0 or epoch == args.epochs:
             if args.use_accelerate:
                 state_dict = trainer.model.state_dict()
             else:
                 state_dict = trainer.model.module.state_dict() if to_be_distributed else trainer.model.state_dict()
-            torch.save(state_dict, os.path.join(args.ckpt_dir, 'epoch_{}.pth'.format(epoch)))
+            checkpoint_path = os.path.join(args.ckpt_dir, 'latest.pth')
+            torch.save(state_dict, checkpoint_path)
+            log_wandb_checkpoint(checkpoint_path, epoch)
     if to_be_distributed:
         destroy_process_group()
+    if is_wandb_enabled():
+        wandb.finish()
 
 
 if __name__ == '__main__':
