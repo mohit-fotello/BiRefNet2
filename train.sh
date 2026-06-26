@@ -10,7 +10,7 @@ case "${task}" in
     'General') epochs=200 && val_last=50 && step=5 ;;
     'General-2K') epochs=250 && val_last=30 && step=2 ;;
     'Matting') epochs=150 && val_last=50 && step=5 ;;
-    'WallMasking') epochs=120 && val_last=20 && step=5 ;;
+    'WallMasking') epochs=250 && val_last=20 && step=5 ;;
 esac
 
 # Train

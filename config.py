@@ -29,6 +29,12 @@ class Config():
             'Matting': ','.join(['TE-P3M-500-NP', 'TE-AM-2k']),
             'WallMasking': '',
         }[self.task]
+        if self.task == 'WallMasking' and not self.testsets:
+            task_root = os.path.join(self.data_root_dir, self.task)
+            self.testsets = ','.join([
+                ds for ds in ('val', 'valid', 'validation', 'Val', 'Valid', 'Validation')
+                if os.path.isdir(os.path.join(task_root, ds))
+            ])
         datasets_all = '+'.join([ds for ds in (os.listdir(os.path.join(self.data_root_dir, self.task)) if os.path.isdir(os.path.join(self.data_root_dir, self.task)) else []) if ds not in self.testsets.split(',')])
         self.training_set = {
             'DIS5K': ['DIS-TR', 'DIS-TR+DIS-TE1+DIS-TE2+DIS-TE3+DIS-TE4'][0],
@@ -76,7 +82,8 @@ class Config():
                 'WallMasking': -20,
             }[self.task]
         ][1]    # choose 0 to skip
-        self.lr = (1e-4 if 'DIS5K' in self.task else 1e-5) * math.sqrt(self.batch_size / 4)     # DIS needs high lr to converge faster. Adapt the lr linearly
+        self.lr = 1e-5
+        self.lr_min = 1e-8
         self.num_workers = max(4, self.batch_size)          # will be decreased to min(it, batch_size) at the initialization of the data_loader
 
         # Backbone settings
@@ -120,8 +127,6 @@ class Config():
         # TRAINING settings - inactive
         self.preproc_methods = ['flip', 'enhance', 'rotate', 'pepper', 'crop'][:4 if not self.background_color_synthesis else 1]
         self.optimizer = ['Adam', 'AdamW'][1]
-        self.lr_decay_epochs = [1e5]    # Set to negative N to decay the lr in the last N-th epoch.
-        self.lr_decay_rate = 0.5
         # Loss
         if self.task in ['Matting']:
             self.lambdas_pix_last = {
