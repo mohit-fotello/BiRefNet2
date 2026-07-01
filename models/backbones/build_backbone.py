@@ -29,17 +29,19 @@ def build_backbone(bb_name, pretrained=True, params_settings=''):
 def load_weights(model, model_name):
     save_model = torch.load(config.weights[model_name], map_location='cpu', weights_only=True)
     model_dict = model.state_dict()
-    state_dict = {k: v if v.size() == model_dict[k].size() else model_dict[k] for k, v in save_model.items() if k in model_dict.keys()}
+    state_dict = {k: v for k, v in save_model.items() if k in model_dict.keys() and v.size() == model_dict[k].size()}
     # to ignore the weights with mismatched size when I modify the backbone itself.
     if not state_dict:
         save_model_keys = list(save_model.keys())
         sub_item = save_model_keys[0] if len(save_model_keys) == 1 else None
-        state_dict = {k: v if v.size() == model_dict[k].size() else model_dict[k] for k, v in save_model[sub_item].items() if k in model_dict.keys()}
+        state_dict = {k: v for k, v in save_model[sub_item].items() if k in model_dict.keys() and v.size() == model_dict[k].size()}
         if not state_dict or not sub_item:
             print('Weights are not successfully loaded. Check the state dict of weights file.')
             return None
         else:
             print('Found correct weights in the "{}" item of loaded state_dict.'.format(sub_item))
-    model_dict.update(state_dict)
-    model.load_state_dict(model_dict)
+    with torch.no_grad():
+        for key, value in state_dict.items():
+            model_dict[key].copy_(value)
+    print('Loaded {} matching tensors for {}.'.format(len(state_dict), model_name))
     return model

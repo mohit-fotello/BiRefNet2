@@ -33,13 +33,13 @@ def str2bool(value):
 WANDB_PROJECT = 'birefnet-wallmasking'
 WANDB_ENTITY = None
 WANDB_RUN_NAME = None
-WANDB_MODE = 'online'
+WANDB_MODE = os.environ.get('WANDB_MODE', 'online')
 WANDB_LOG_FREQ = 1
 WANDB_LOG_SAMPLES = True
 WANDB_SAMPLE_FREQ = 10
 WANDB_VAL_SAMPLE_FREQ = 1
 WANDB_NUM_SAMPLES = 2
-WANDB_LOG_MODEL = False
+WANDB_LOG_MODEL = True
 WANDB_LOG_BEST_MODEL = True
 
 
@@ -62,7 +62,7 @@ if args.val_sets is not None:
     config.training_set = '+'.join(ds for ds in config.training_set.split('+') if ds not in val_set_names)
 if args.batch_size is not None:
     config.batch_size = args.batch_size
-    config.num_workers = max(4, config.batch_size)
+    config.num_workers = 8
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device_seed = 0
 wandb = None
@@ -91,8 +91,10 @@ if args.use_accelerate:
 to_be_distributed = args.dist
 if to_be_distributed:
     init_process_group(backend="nccl", timeout=datetime.timedelta(seconds=3600*10))
-    device = int(os.environ["LOCAL_RANK"])
-    device_seed = device
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device('cuda', local_rank)
+    device_seed = local_rank
 else:
     if args.use_accelerate:
         device = accelerator.local_process_index
@@ -227,12 +229,12 @@ def prepare_dataloader(dataset: torch.utils.data.Dataset, batch_size: int, to_be
     # Prepare dataloaders
     if to_be_distributed:
         return torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=batch_size, num_workers=min(config.num_workers, batch_size), pin_memory=True,
+            dataset=dataset, batch_size=batch_size, num_workers=config.num_workers, pin_memory=True,
             shuffle=False, sampler=DistributedSampler(dataset), drop_last=is_train, collate_fn=custom_collate_fn if is_train and config.dynamic_size else None
         )
     else:
         return torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=batch_size, num_workers=min(config.num_workers, batch_size), pin_memory=True,
+            dataset=dataset, batch_size=batch_size, num_workers=config.num_workers, pin_memory=True,
             shuffle=is_train, sampler=None, drop_last=is_train, collate_fn=custom_collate_fn if is_train and config.dynamic_size else None
         )
 
@@ -276,10 +278,17 @@ def init_models_optimizers(epochs, to_be_distributed):
             logger.info("=> no checkpoint found at '{}'".format(args.resume))
     if not args.use_accelerate:
         if to_be_distributed:
+            logger.info(f"Moving model to device {device}.")
             model = model.to(device)
-            model = DDP(model, device_ids=[device])
+            logger.info("Wrapping model with DDP.")
+            model = DDP(model, device_ids=[device.index])
         else:
+            logger.info(f"Moving model to device {device}.")
             model = model.to(device)
+            if device.type == 'cuda' and torch.cuda.device_count() > 1:
+                logger.info(f"Wrapping model with DataParallel on {torch.cuda.device_count()} GPUs.")
+                model = nn.DataParallel(model)
+            logger.info("Model device setup complete.")
     if config.compile:
         model = torch.compile(model, mode=['default', 'reduce-overhead', 'max-autotune'][0])
     if config.precisionHigh:
@@ -287,9 +296,12 @@ def init_models_optimizers(epochs, to_be_distributed):
 
     # Setting optimizer
     if config.optimizer == 'AdamW':
+        logger.info("Creating AdamW optimizer.")
         optimizer = optim.AdamW(params=[p for p in model.parameters() if p.requires_grad], lr=config.lr, weight_decay=1e-2)
     elif config.optimizer == 'Adam':
+        logger.info("Creating Adam optimizer.")
         optimizer = optim.Adam(params=[p for p in model.parameters() if p.requires_grad], lr=config.lr, weight_decay=0)
+    logger.info("Optimizer created.")
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=epochs,
@@ -335,14 +347,22 @@ class Trainer:
         inputs, gts = self._batch_inputs_gts(batch)
         class_labels = batch[2] if args.use_accelerate else batch[2].to(device)
         self.optimizer.zero_grad()
-        scaled_preds, class_preds_lst = self.model(inputs)
+        use_native_amp = (not args.use_accelerate) and device.type == 'cuda' and config.mixed_precision in ('fp16', 'bf16')
+        amp_dtype = torch.bfloat16 if config.mixed_precision == 'bf16' else torch.float16
+        amp_context = torch.autocast(device_type='cuda', dtype=amp_dtype) if use_native_amp else nullcontext()
+        with amp_context:
+            scaled_preds, class_preds_lst = self.model(inputs)
+        # Losses are computed in fp32 outside autocast: BCELoss/BCE are unsafe under autocast.
+        # Use BCE-with-logits (no [0,1] input assert, numerically stable on NaN/Inf).
         if config.out_ref:
             (outs_gdt_pred, outs_gdt_label), scaled_preds = scaled_preds
             for _idx, (_gdt_pred, _gdt_label) in enumerate(zip(outs_gdt_pred, outs_gdt_label)):
-                _gdt_pred = nn.functional.interpolate(_gdt_pred, size=_gdt_label.shape[2:], mode='bilinear', align_corners=True).sigmoid()
-                _gdt_label = _gdt_label.sigmoid()
-                loss_gdt = self.criterion_gdt(_gdt_pred, _gdt_label) if _idx == 0 else self.criterion_gdt(_gdt_pred, _gdt_label) + loss_gdt
+                _gdt_pred = nn.functional.interpolate(_gdt_pred, size=_gdt_label.shape[2:], mode='bilinear', align_corners=True).float()
+                _gdt_label = _gdt_label.float().sigmoid()
+                _loss_gdt = nn.functional.binary_cross_entropy_with_logits(_gdt_pred, _gdt_label)
+                loss_gdt = _loss_gdt if _idx == 0 else _loss_gdt + loss_gdt
             # self.loss_dict['loss_gdt'] = loss_gdt.item()
+        scaled_preds = [p.float() for p in scaled_preds]
         if None in class_preds_lst:
             loss_cls = 0.
         else:
@@ -359,20 +379,32 @@ class Trainer:
             loss = loss + loss_gdt * 1.0
 
         loss_value = loss.item()
+        finite = torch.tensor([float(np.isfinite(loss_value))], device=device)
+        if to_be_distributed:
+            torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
+        if finite.item() <= 0:
+            message = f'Non-finite loss detected (loss={loss_value}) at epoch {epoch} iter {batch_idx}; stopping training.'
+            logger.info(message)
+            raise RuntimeError(message)
         self.loss_log.update(loss_value, inputs.size(0))
         if capture_samples:
             log_wandb_samples(inputs, gts, scaled_preds, epoch, batch_idx, self.global_step)
         if args.use_accelerate:
             loss = loss / accelerator.gradient_accumulation_steps
             accelerator.backward(loss)
+            accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
         else:
             loss.backward()
-        self.optimizer.step()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
         return loss_value
 
     def train_epoch(self, epoch):
         global logger_loss_idx
         self.model.train()
+        if to_be_distributed and hasattr(self.train_loader.sampler, 'set_epoch'):
+            self.train_loader.sampler.set_epoch(epoch)
         self.loss_log.reset()
         self.loss_dict = {}
         if config.task != 'WallMasking' and epoch > args.epochs + config.finetune_last_epochs:
@@ -386,6 +418,8 @@ class Trainer:
                         self.pix_loss.lambdas_pix_last[loss_name] *= multiplier
 
         for batch_idx, batch in enumerate(self.train_loader):
+            if batch_idx == 0:
+                logger.info("Fetched first training batch.")
             # with nullcontext if not args.use_accelerate or accelerator.gradient_accumulation_steps <= 1 else accelerator.accumulate(self.model):
             capture_samples = (
                 WANDB_LOG_SAMPLES
@@ -491,7 +525,7 @@ def main():
         val_loss = trainer.validate_epoch(epoch)
         trainer.save_best_checkpoint(epoch, val_loss)
         # Save only the latest checkpoint to avoid accumulating large epoch files.
-        if epoch % config.save_step == 0 or epoch == args.epochs:
+        if (epoch % config.save_step == 0 or epoch == args.epochs) and is_main_process():
             checkpoint_path = os.path.join(args.ckpt_dir, 'latest.pth')
             torch.save(trainer.model_state_dict(), checkpoint_path)
             log_wandb_checkpoint(checkpoint_path, epoch)

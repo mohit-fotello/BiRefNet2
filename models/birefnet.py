@@ -99,15 +99,29 @@ class BiRefNet(
         return (x1, x2, x3, x4), class_preds
 
     def forward_ori(self, x):
+        debug_forward = not getattr(self, "_debug_forward_once", False)
+        if debug_forward:
+            print("BiRefNet forward: encoder start", flush=True)
         ########## Encoder ##########
         (x1, x2, x3, x4), class_preds = self.forward_enc(x)
+        if debug_forward:
+            print("BiRefNet forward: encoder done", flush=True)
         if self.config.squeeze_block:
+            if debug_forward:
+                print("BiRefNet forward: squeeze start", flush=True)
             x4 = self.squeeze_module(x4)
+            if debug_forward:
+                print("BiRefNet forward: squeeze done", flush=True)
         ########## Decoder ##########
         features = [x, x1, x2, x3, x4]
         if self.training and self.config.out_ref:
             features.append(laplacian(torch.mean(x, dim=1).unsqueeze(1), kernel_size=5))
+        if debug_forward:
+            print("BiRefNet forward: decoder start", flush=True)
         scaled_preds = self.decoder(features)
+        if debug_forward:
+            print("BiRefNet forward: decoder done", flush=True)
+            self._debug_forward_once = True
         return scaled_preds, class_preds
 
     def forward(self, x):
